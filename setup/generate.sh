@@ -9,19 +9,22 @@ mkdir -p secrets
 
 random_hex() { openssl rand -hex "$1"; }
 
-if [ ! -f secrets/jwt_private.pem ]; then
+# Cada par se genera completo: si falta una de las dos mitades, se rehace.
+if [ ! -f secrets/jwt_private.pem ] || [ ! -f secrets/jwt_public.pem ]; then
     echo "-> Generando par de llaves RSA para firmar los JWT"
     openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 \
         -out secrets/jwt_private.pem 2>/dev/null
     openssl pkey -in secrets/jwt_private.pem -pubout -out secrets/jwt_public.pem
 fi
 
-if [ ! -f secrets/tls_cert.pem ]; then
+if [ ! -f secrets/tls_cert.pem ] || [ ! -f secrets/tls_key.pem ]; then
     echo "-> Generando certificado TLS autofirmado para localhost"
     openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
         -keyout secrets/tls_key.pem -out secrets/tls_cert.pem \
         -subj "/CN=localhost" \
-        -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
+        -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+        -addext "basicConstraints=critical,CA:FALSE" \
+        -addext "extendedKeyUsage=serverAuth" 2>/dev/null
 fi
 
 # Cada llave privada solo la lee el usuario sin privilegios del contenedor que la usa.
@@ -37,6 +40,8 @@ if [ ! -f .env ]; then
 BIND_ADDRESS=127.0.0.1
 HTTPS_PORT=8443
 HTTP_PORT=8080
+# Nombres con los que se puede abrir el sitio; cualquier otro se rechaza.
+SERVER_NAME="localhost 127.0.0.1"
 
 AUTH_DB_ROOT_PASSWORD=$(random_hex 24)
 AUTH_DB_PASSWORD=$(random_hex 24)

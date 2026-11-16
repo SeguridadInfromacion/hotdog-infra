@@ -40,13 +40,17 @@ aceptar. Los usuarios iniciales (`admin` y `cajero`) y sus contraseñas están e
 
 Si el puerto 8443 u 8080 está ocupado, cambia `HTTPS_PORT` o `HTTP_PORT` en `.env`.
 
+En Docker Desktop (Windows y macOS) el gateway no ve la IP real de cada cliente,
+sino la de la red virtual de Docker: el límite de peticiones y la IP de la
+auditoría son compartidos por todos. En un servidor Linux se ve la IP real.
+
 ## Verificar la seguridad en vivo
 
 ```bash
 bash scripts/security-checks.sh
 ```
 
-Lanza 47 ataques y verificaciones contra el sistema en ejecución: tokens
+Lanza 61 ataques y verificaciones contra el sistema en ejecución: tokens
 falsificados, inyección SQL, escalamiento de rol, fuerza bruta, aislamiento de
 red, privilegios de la base y más.
 
@@ -54,7 +58,7 @@ red, privilegios de la base y más.
 
 | Ruta | Para qué |
 |---|---|
-| `docker-compose.yml` | Los 8 contenedores, 5 redes, endurecimiento y secretos |
+| `docker-compose.yml` | Los 8 contenedores, 9 redes, endurecimiento y secretos |
 | `docker-compose.setup.yml` + `setup/` | Generador de llaves JWT, certificado TLS y contraseñas |
 | `gateway/templates/default.conf.template` | nginx: HTTPS, cabeceras, límites y enrutamiento |
 | `scripts/security-checks.sh` | Pruebas de seguridad en vivo |
@@ -63,7 +67,8 @@ red, privilegios de la base y más.
 ## Decisiones de seguridad
 
 - **Una sola puerta.** Solo el gateway publica puertos, y por defecto solo en `127.0.0.1`.
-- **Redes segmentadas.** Cada base vive en una red interna a la que solo llega su servicio. La red `backend` no tiene salida a internet.
+- **Una red por pareja.** Dos contenedores comparten red solo si necesitan hablarse (gateway con cada servicio, cada servicio con su base, ventas con productos). Todas son internas menos la del gateway. Las redes del gateway usan las subredes fijas `172.30.1.0/29` a `172.30.3.0/29`; si chocan con otra red de tu máquina, cámbialas en `docker-compose.yml` junto con `FORWARDED_ALLOW_IPS`.
+- **Solo se abre con el nombre esperado.** El gateway atiende `localhost` y `127.0.0.1` (variable `SERVER_NAME`); con otra cabecera `Host` corta la conexión. Para abrirlo desde otra máquina hay que agregar su nombre o IP a `SERVER_NAME`, poner `BIND_ADDRESS=0.0.0.0` y generar un certificado para ese nombre.
 - **Contenedores endurecidos.** Sin root, disco de solo lectura, sin capacidades de Linux, sin escalamiento de privilegios, con límites de memoria y procesos.
 - **Llaves asimétricas.** Solo `auth-service` monta la llave privada; los demás reciben únicamente la pública.
 - **Sin secretos en git.** Se generan al azar en cada instalación.

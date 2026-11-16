@@ -4,9 +4,17 @@
 #                                       \--> auth-service     --> db-auth
 #                                       \--> products-service --> db-products
 #                                       \--> orders-service   --> db-orders
+#                                                  \--> products-service (precios)
 #
 # Requiere que los demás repositorios estén clonados en la carpeta hermana (../).
 name: hotdog
+
+# Los logs rotan: ni un atacante ni un error en bucle pueden llenar el disco.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
 
 # Endurecimiento común a todos los contenedores de aplicación.
 x-hardened: &hardened
@@ -17,6 +25,8 @@ x-hardened: &hardened
     - no-new-privileges:true      # sin escalamiento de privilegios
   pids_limit: 200
   mem_limit: 256m
+  cpus: 1.0
+  logging: *logging
 
 x-api-healthcheck: &api-healthcheck
   test:
@@ -39,7 +49,11 @@ x-postgres: &postgres
   cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
   pids_limit: 200
   mem_limit: 256m
+  cpus: 1.0
+  logging: *logging
   healthcheck:
+    # -h 127.0.0.1: durante la inicialización PostgreSQL solo escucha por socket,
+    # así que no se reporta "sano" hasta que terminaron los scripts de esquema y roles.
     test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d $$POSTGRES_DB"]
     interval: 5s
     timeout: 3s
@@ -55,6 +69,7 @@ services:
       - "${BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-8080}:8080"
     environment:
       HTTPS_PORT: ${HTTPS_PORT:-8443}
+      SERVER_NAME: ${SERVER_NAME:-localhost 127.0.0.1}
     volumes:
       - ./gateway/templates:/etc/nginx/templates:ro
     tmpfs:
@@ -63,7 +78,7 @@ services:
     secrets:
       - tls_cert
       - tls_key
-    networks: [edge, backend]
+    networks: [edge, gw-frontend, gw-auth, gw-products, gw-orders]
     depends_on:
       frontend: { condition: service_healthy }
       auth-service: { condition: service_healthy }
@@ -81,7 +96,7 @@ services:
     build: ../hotdog-frontend
     tmpfs:
       - /tmp:uid=101,gid=101
-    networks: [backend]
+    networks: [gw-frontend]
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/"]
       interval: 10s
@@ -92,6 +107,8 @@ services:
   auth-service:
     <<: *hardened
     build: ../hotdog-auth-service
+    # Argon2id usa 64 MiB por verificación: se deja margen para varios logins a la vez.
+    mem_limit: 512m
     environment:
       DATABASE_URL: postgresql+psycopg://auth_app:${AUTH_DB_PASSWORD}@db-auth:5432/auth
       JWT_PRIVATE_KEY_FILE: /run/secrets/jwt_private_key
@@ -100,11 +117,13 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
       DEMO_CASHIER_USERNAME: ${DEMO_CASHIER_USERNAME:-}
       DEMO_CASHIER_PASSWORD: ${DEMO_CASHIER_PASSWORD:-}
+      # La IP del cliente (X-Forwarded-For) solo se le cree al gateway.
+      FORWARDED_ALLOW_IPS: 172.30.1.0/29
     secrets:
       - jwt_private_key           # solo este servicio puede FIRMAR tokens
       - jwt_public_key
     tmpfs: [/tmp]
-    networks: [backend, auth-data]
+    networks: [gw-auth, auth-data]
     depends_on:
       db-auth: { condition: service_healthy }
     healthcheck: *api-healthcheck
@@ -120,7 +139,8 @@ services:
       - db-auth-data:/var/lib/postgresql/data
       - ../hotdog-database/auth/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
       - ../hotdog-database/common/05_audit.sql:/docker-entrypoint-initdb.d/05_audit.sql:ro
-      - ../hotdog-database/common/90_roles.sh:/docker-entrypoint-initdb.d/90_roles.sh:ro
+      - ../hotdog-database/common/20_role.sh:/docker-entrypoint-initdb.d/20_role.sh:ro
+      - ../hotdog-database/auth/30_grants.sql:/docker-entrypoint-initdb.d/30_grants.sql:ro
     networks: [auth-data]
 
   # ------------------------------------------------------- products-service
@@ -130,10 +150,11 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://products_app:${PRODUCTS_DB_PASSWORD}@db-products:5432/products
       JWT_PUBLIC_KEY_FILE: /run/secrets/jwt_public_key
+      FORWARDED_ALLOW_IPS: 172.30.2.0/29
     secrets:
       - jwt_public_key            # solo puede VERIFICAR tokens
     tmpfs: [/tmp]
-    networks: [backend, products-data]
+    networks: [gw-products, orders-products, products-data]
     depends_on:
       db-products: { condition: service_healthy }
     healthcheck: *api-healthcheck
@@ -150,7 +171,8 @@ services:
       - ../hotdog-database/products/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
       - ../hotdog-database/common/05_audit.sql:/docker-entrypoint-initdb.d/05_audit.sql:ro
       - ../hotdog-database/products/10_seed.sql:/docker-entrypoint-initdb.d/10_seed.sql:ro
-      - ../hotdog-database/common/90_roles.sh:/docker-entrypoint-initdb.d/90_roles.sh:ro
+      - ../hotdog-database/common/20_role.sh:/docker-entrypoint-initdb.d/20_role.sh:ro
+      - ../hotdog-database/products/30_grants.sql:/docker-entrypoint-initdb.d/30_grants.sql:ro
     networks: [products-data]
 
   # --------------------------------------------------------- orders-service
@@ -161,10 +183,11 @@ services:
       DATABASE_URL: postgresql+psycopg://orders_app:${ORDERS_DB_PASSWORD}@db-orders:5432/orders
       JWT_PUBLIC_KEY_FILE: /run/secrets/jwt_public_key
       PRODUCTS_SERVICE_URL: http://products-service:8000
+      FORWARDED_ALLOW_IPS: 172.30.3.0/29
     secrets:
       - jwt_public_key
     tmpfs: [/tmp]
-    networks: [backend, orders-data]
+    networks: [gw-orders, orders-products, orders-data]
     depends_on:
       db-orders: { condition: service_healthy }
       products-service: { condition: service_healthy }
@@ -181,14 +204,28 @@ services:
       - db-orders-data:/var/lib/postgresql/data
       - ../hotdog-database/orders/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
       - ../hotdog-database/common/05_audit.sql:/docker-entrypoint-initdb.d/05_audit.sql:ro
-      - ../hotdog-database/common/90_roles.sh:/docker-entrypoint-initdb.d/90_roles.sh:ro
+      - ../hotdog-database/common/20_role.sh:/docker-entrypoint-initdb.d/20_role.sh:ro
+      - ../hotdog-database/orders/30_grants.sql:/docker-entrypoint-initdb.d/30_grants.sql:ro
     networks: [orders-data]
 
-# Segmentación de red: cada base vive en una red interna a la que solo
-# llega su propio servicio. "backend" tampoco tiene salida a internet.
+# Segmentación de red: una red por cada pareja que de verdad necesita hablarse.
+# Todas menos "edge" son internas (sin salida a internet). Así, por ejemplo, el
+# contenedor del frontend no puede llamar a un servicio saltándose el gateway,
+# y ningún servicio alcanza la base de datos de otro.
 networks:
   edge:
-  backend:
+  gw-frontend:
+    internal: true
+  gw-auth:
+    internal: true
+    ipam: { config: [{ subnet: 172.30.1.0/29 }] }
+  gw-products:
+    internal: true
+    ipam: { config: [{ subnet: 172.30.2.0/29 }] }
+  gw-orders:
+    internal: true
+    ipam: { config: [{ subnet: 172.30.3.0/29 }] }
+  orders-products:
     internal: true
   auth-data:
     internal: true

@@ -57,6 +57,11 @@ if grep -qiE '^server: nginx/[0-9]' <<<"$headers"; then
 else
     check "El servidor no revela su versión" oculta oculta
 fi
+check "Cabecera Host ajena: se corta la conexión" \
+    "$(status -H 'Host: sitio-malicioso.example' "$BASE/")" 000
+check "TLS 1.1 (obsoleto) rechazado" "$(status --tlsv1.1 --tls-max 1.1 "$BASE/")" 000
+check "Cifrado débil sin secreto hacia adelante (AES128-SHA) rechazado" \
+    "$(status --tls-max 1.2 --ciphers AES128-SHA "$BASE/")" 000
 
 # ------------------------------------------------------------------------------
 section "2. Sin sesión no hay datos"
@@ -76,6 +81,12 @@ contains "Cookie Secure (solo viaja por HTTPS)" "$cookie" "Secure"
 contains "Cookie SameSite=Strict (anti-CSRF)" "$cookie" "SameSite=strict"
 body="$(curl -sk "${CSRF[@]}" "${JSON[@]}" -d '{"username":"admin'"'"' OR 1=1 --","password":"x"}' "$BASE/api/auth/login")"
 contains "Inyección SQL en el login: solo credenciales inválidas" "$body" "incorrectos"
+check "Renovar la sesión entrega un token nuevo -> 200" \
+    "$(status -X POST -b "$WORK/admin" -c "$WORK/admin" "${CSRF[@]}" "$BASE/api/auth/refresh")" 200
+weak='{"username":"zz","full_name":"Zz","password":"SoloLetrasSinNumeros","role":"cashier"}'
+body="$(curl -sk -b "$WORK/admin" "${CSRF[@]}" "${JSON[@]}" -d "$weak" "$BASE/api/users")"
+if grep -q "SoloLetrasSinNumeros" <<<"$body"; then echoed=si; else echoed=no; fi
+check "Un error de validación NO devuelve la contraseña enviada" "$echoed" no
 
 # ------------------------------------------------------------------------------
 section "4. Control de acceso por rol (verificado en cada servicio)"
@@ -117,6 +128,23 @@ check "Cuerpo gigante (200 KB) rechazado por el gateway -> 413" \
     "$(head -c 200000 /dev/zero | tr '\0' 'a' | status -b "$WORK/cashier" "${CSRF[@]}" "${JSON[@]}" \
         --data-binary @- "$BASE/api/orders")" 413
 
+check "Byte nulo en el nombre del cliente -> 422 (no un error 500)" \
+    "$(status -b "$WORK/cashier" "${CSRF[@]}" "${JSON[@]}" \
+        -d "{\"customer_name\":\"a\\u0000b\",\"items\":[{\"product_id\":\"$product_id\",\"quantity\":1}]}" "$BASE/api/orders")" 422
+check "Salto de línea para falsificar el log -> 422" \
+    "$(status -b "$WORK/admin" "${CSRF[@]}" "${JSON[@]}" \
+        -d '{"name":"zz\nINFO audit actor=falso","price":100}' "$BASE/api/products")" 422
+
+# ------------------------------------------------------------------------------
+section "6b. Cerrar sesión invalida el token, no solo borra la cookie"
+copied="$(awk '$6 == "access_token" {print $7}' "$WORK/cashier")"
+check "Token copiado funciona antes de salir -> 200" \
+    "$(status -H "Authorization: Bearer $copied" "$BASE/api/auth/me")" 200
+check "El cajero cierra sesión -> 204" \
+    "$(status -X POST -b "$WORK/cashier" "${CSRF[@]}" "$BASE/api/auth/logout")" 204
+check "El token copiado ya no sirve -> 401" \
+    "$(status -H "Authorization: Bearer $copied" "$BASE/api/auth/me")" 401
+
 # ------------------------------------------------------------------------------
 section "7. Superficie expuesta"
 check "/health interno no se publica -> 404" "$(status "$BASE/api/health")" 404
@@ -151,10 +179,22 @@ check "orders-service NO alcanza la base de usuarios" \
     "$(docker compose exec -T orders-service python -c "$probe" db-auth | tr -d '\r')" inalcanzable
 check "orders-service SÍ alcanza su propia base" \
     "$(docker compose exec -T orders-service python -c "$probe" db-orders | tr -d '\r')" alcanzable
-sql() { docker compose exec -T db-products psql -U products_app -d products -tAc "$1" 2>&1; }
-contains "El rol de la app NO puede borrar tablas" "$(sql 'DROP TABLE products')" "must be owner"
-contains "El rol de la app NO puede borrar la auditoría" "$(sql 'DELETE FROM audit_log')" "permission denied"
-contains "El rol de la app NO puede alterar la auditoría" "$(sql "UPDATE audit_log SET actor = 'nadie'")" "permission denied"
+if docker compose exec -T frontend wget -q -T 2 -O /dev/null http://auth-service:8000/health 2>/dev/null; then
+    reach=alcanzable
+else
+    reach=inalcanzable
+fi
+check "El contenedor del frontend NO puede saltarse el gateway" "$reach" inalcanzable
+
+sql() { # sql servicio consulta: ejecuta como el rol de la aplicación de ese servicio
+    docker compose exec -T "db-$1" psql -U "$1_app" -d "$1" -tAc "$2" 2>&1
+}
+contains "El rol de la app NO puede borrar tablas" "$(sql products 'DROP TABLE products')" "must be owner"
+contains "El rol de la app NO puede borrar la auditoría" "$(sql products 'DELETE FROM audit_log')" "permission denied"
+contains "El rol de la app NO puede alterar la auditoría" "$(sql products "UPDATE audit_log SET actor = 'nadie'")" "permission denied"
+contains "orders-service NO puede borrar ventas" "$(sql orders 'DELETE FROM orders')" "permission denied"
+contains "orders-service NO puede cambiar el total de una venta" "$(sql orders 'UPDATE orders SET total = 1')" "permission denied"
+contains "auth-service NO puede borrar usuarios" "$(sql auth 'DELETE FROM users')" "permission denied"
 
 # ------------------------------------------------------------------------------
 section "10. Fuerza bruta contra el login (límite de peticiones)"
