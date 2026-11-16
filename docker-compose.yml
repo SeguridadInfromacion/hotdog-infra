@@ -1,0 +1,213 @@
+# PerroCaliente Express: sistema distribuido completo.
+#
+#   navegador --HTTPS--> gateway (nginx) --> frontend
+#                                       \--> auth-service     --> db-auth
+#                                       \--> products-service --> db-products
+#                                       \--> orders-service   --> db-orders
+#
+# Requiere que los demás repositorios estén clonados en la carpeta hermana (../).
+name: hotdog
+
+# Endurecimiento común a todos los contenedores de aplicación.
+x-hardened: &hardened
+  restart: unless-stopped
+  read_only: true                 # sistema de archivos de solo lectura
+  cap_drop: [ALL]                 # sin capacidades de Linux
+  security_opt:
+    - no-new-privileges:true      # sin escalamiento de privilegios
+  pids_limit: 200
+  mem_limit: 256m
+
+x-api-healthcheck: &api-healthcheck
+  test:
+    - CMD
+    - python
+    - -c
+    - "import urllib.request as r; r.urlopen('http://127.0.0.1:8000/health', timeout=2)"
+  interval: 10s
+  timeout: 3s
+  retries: 6
+  start_period: 10s
+
+x-postgres: &postgres
+  image: postgres:17-alpine
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+  # Lo mínimo que necesita el arranque oficial de PostgreSQL.
+  cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+  pids_limit: 200
+  mem_limit: 256m
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d $$POSTGRES_DB"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+
+services:
+  # ---------------------------------------------------------------- gateway
+  gateway:
+    <<: *hardened
+    image: nginxinc/nginx-unprivileged:1.29-alpine
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${HTTPS_PORT:-8443}:8443"
+      - "${BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-8080}:8080"
+    environment:
+      HTTPS_PORT: ${HTTPS_PORT:-8443}
+    volumes:
+      - ./gateway/templates:/etc/nginx/templates:ro
+    tmpfs:
+      - /tmp:uid=101,gid=101
+      - /etc/nginx/conf.d:uid=101,gid=101
+    secrets:
+      - tls_cert
+      - tls_key
+    networks: [edge, backend]
+    depends_on:
+      frontend: { condition: service_healthy }
+      auth-service: { condition: service_healthy }
+      products-service: { condition: service_healthy }
+      orders-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "--no-check-certificate", "https://127.0.0.1:8443/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # --------------------------------------------------------------- frontend
+  frontend:
+    <<: *hardened
+    build: ../hotdog-frontend
+    tmpfs:
+      - /tmp:uid=101,gid=101
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ----------------------------------------------------------- auth-service
+  auth-service:
+    <<: *hardened
+    build: ../hotdog-auth-service
+    environment:
+      DATABASE_URL: postgresql+psycopg://auth_app:${AUTH_DB_PASSWORD}@db-auth:5432/auth
+      JWT_PRIVATE_KEY_FILE: /run/secrets/jwt_private_key
+      JWT_PUBLIC_KEY_FILE: /run/secrets/jwt_public_key
+      ADMIN_USERNAME: ${ADMIN_USERNAME}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      DEMO_CASHIER_USERNAME: ${DEMO_CASHIER_USERNAME:-}
+      DEMO_CASHIER_PASSWORD: ${DEMO_CASHIER_PASSWORD:-}
+    secrets:
+      - jwt_private_key           # solo este servicio puede FIRMAR tokens
+      - jwt_public_key
+    tmpfs: [/tmp]
+    networks: [backend, auth-data]
+    depends_on:
+      db-auth: { condition: service_healthy }
+    healthcheck: *api-healthcheck
+
+  db-auth:
+    <<: *postgres
+    environment:
+      POSTGRES_DB: auth
+      POSTGRES_PASSWORD: ${AUTH_DB_ROOT_PASSWORD}
+      APP_DB_USER: auth_app
+      APP_DB_PASSWORD: ${AUTH_DB_PASSWORD}
+    volumes:
+      - db-auth-data:/var/lib/postgresql/data
+      - ../hotdog-database/auth/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ../hotdog-database/common/05_audit.sql:/docker-entrypoint-initdb.d/05_audit.sql:ro
+      - ../hotdog-database/common/90_roles.sh:/docker-entrypoint-initdb.d/90_roles.sh:ro
+    networks: [auth-data]
+
+  # ------------------------------------------------------- products-service
+  products-service:
+    <<: *hardened
+    build: ../hotdog-products-service
+    environment:
+      DATABASE_URL: postgresql+psycopg://products_app:${PRODUCTS_DB_PASSWORD}@db-products:5432/products
+      JWT_PUBLIC_KEY_FILE: /run/secrets/jwt_public_key
+    secrets:
+      - jwt_public_key            # solo puede VERIFICAR tokens
+    tmpfs: [/tmp]
+    networks: [backend, products-data]
+    depends_on:
+      db-products: { condition: service_healthy }
+    healthcheck: *api-healthcheck
+
+  db-products:
+    <<: *postgres
+    environment:
+      POSTGRES_DB: products
+      POSTGRES_PASSWORD: ${PRODUCTS_DB_ROOT_PASSWORD}
+      APP_DB_USER: products_app
+      APP_DB_PASSWORD: ${PRODUCTS_DB_PASSWORD}
+    volumes:
+      - db-products-data:/var/lib/postgresql/data
+      - ../hotdog-database/products/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ../hotdog-database/common/05_audit.sql:/docker-entrypoint-initdb.d/05_audit.sql:ro
+      - ../hotdog-database/products/10_seed.sql:/docker-entrypoint-initdb.d/10_seed.sql:ro
+      - ../hotdog-database/common/90_roles.sh:/docker-entrypoint-initdb.d/90_roles.sh:ro
+    networks: [products-data]
+
+  # --------------------------------------------------------- orders-service
+  orders-service:
+    <<: *hardened
+    build: ../hotdog-orders-service
+    environment:
+      DATABASE_URL: postgresql+psycopg://orders_app:${ORDERS_DB_PASSWORD}@db-orders:5432/orders
+      JWT_PUBLIC_KEY_FILE: /run/secrets/jwt_public_key
+      PRODUCTS_SERVICE_URL: http://products-service:8000
+    secrets:
+      - jwt_public_key
+    tmpfs: [/tmp]
+    networks: [backend, orders-data]
+    depends_on:
+      db-orders: { condition: service_healthy }
+      products-service: { condition: service_healthy }
+    healthcheck: *api-healthcheck
+
+  db-orders:
+    <<: *postgres
+    environment:
+      POSTGRES_DB: orders
+      POSTGRES_PASSWORD: ${ORDERS_DB_ROOT_PASSWORD}
+      APP_DB_USER: orders_app
+      APP_DB_PASSWORD: ${ORDERS_DB_PASSWORD}
+    volumes:
+      - db-orders-data:/var/lib/postgresql/data
+      - ../hotdog-database/orders/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ../hotdog-database/common/05_audit.sql:/docker-entrypoint-initdb.d/05_audit.sql:ro
+      - ../hotdog-database/common/90_roles.sh:/docker-entrypoint-initdb.d/90_roles.sh:ro
+    networks: [orders-data]
+
+# Segmentación de red: cada base vive en una red interna a la que solo
+# llega su propio servicio. "backend" tampoco tiene salida a internet.
+networks:
+  edge:
+  backend:
+    internal: true
+  auth-data:
+    internal: true
+  products-data:
+    internal: true
+  orders-data:
+    internal: true
+
+volumes:
+  db-auth-data:
+  db-products-data:
+  db-orders-data:
+
+secrets:
+  jwt_private_key:
+    file: ./secrets/jwt_private.pem
+  jwt_public_key:
+    file: ./secrets/jwt_public.pem
+  tls_cert:
+    file: ./secrets/tls_cert.pem
+  tls_key:
+    file: ./secrets/tls_key.pem

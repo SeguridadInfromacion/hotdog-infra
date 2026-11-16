@@ -1,0 +1,10 @@
+# Paso previo, una sola vez: genera llaves, certificado y contraseñas.
+#   docker compose -f docker-compose.setup.yml run --rm setup
+name: hotdog-setup
+
+services:
+  setup:
+    build: ./setup
+    volumes:
+      - .:/work
+    network_mode: none

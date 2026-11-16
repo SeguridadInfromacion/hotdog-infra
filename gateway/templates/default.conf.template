@@ -1,0 +1,124 @@
+# Gateway de PerroCaliente Express.
+# Es la ÚNICA puerta de entrada: ningún otro contenedor publica puertos.
+# La imagen de nginx reemplaza ${HTTPS_PORT} al arrancar; las variables de
+# nginx ($host, $remote_addr...) quedan intactas.
+
+server_tokens off;
+
+# Límite de peticiones por IP. El de login es mucho más estricto: frena fuerza bruta.
+limit_req_zone $binary_remote_addr zone=login:10m rate=10r/m;
+limit_req_zone $binary_remote_addr zone=api:10m rate=20r/s;
+limit_req_status 429;
+
+# Todo lo que llegue por HTTP se redirige a HTTPS.
+server {
+    listen 8080;
+    server_name _;
+    return 301 https://$host:${HTTPS_PORT}$request_uri;
+}
+
+server {
+    listen 8443 ssl;
+    http2 on;
+    server_name _;
+
+    ssl_certificate     /run/secrets/tls_cert;
+    ssl_certificate_key /run/secrets/tls_key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_tickets off;
+
+    client_max_body_size 64k;
+    client_body_timeout  10s;
+    client_header_timeout 10s;
+
+    # DNS interno de Docker: permite que un servicio se reinicie sin tumbar el gateway.
+    resolver 127.0.0.11 valid=10s ipv6=off;
+
+    # Cabeceras de seguridad para todas las respuestas.
+    # (No repetir add_header dentro de un location: anularía estas.)
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()" always;
+    add_header Cross-Origin-Opener-Policy "same-origin" always;
+    add_header Cross-Origin-Resource-Policy "same-origin" always;
+
+    proxy_http_version 1.1;
+    proxy_set_header Host              $host;
+    # Se sobrescribe (no se concatena) para que el cliente no pueda falsificar su IP.
+    proxy_set_header X-Forwarded-For   $remote_addr;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header Connection        "";
+    proxy_hide_header X-Powered-By;
+    proxy_connect_timeout 3s;
+    proxy_read_timeout    15s;
+
+    error_page 429         = @too_many_requests;
+    error_page 502 503 504 = @service_unavailable;
+
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok";
+    }
+
+    # --- auth-service -------------------------------------------------------
+    location = /api/auth/login {
+        limit_req zone=login burst=5 nodelay;
+        set $upstream http://auth-service:8000;
+        proxy_pass $upstream;
+    }
+
+    location /api/auth/ {
+        limit_req zone=api burst=40 nodelay;
+        set $upstream http://auth-service:8000;
+        proxy_pass $upstream;
+    }
+
+    location /api/users {
+        limit_req zone=api burst=40 nodelay;
+        set $upstream http://auth-service:8000;
+        proxy_pass $upstream;
+    }
+
+    # --- products-service ---------------------------------------------------
+    location /api/products {
+        limit_req zone=api burst=40 nodelay;
+        set $upstream http://products-service:8000;
+        proxy_pass $upstream;
+    }
+
+    # --- orders-service -----------------------------------------------------
+    location /api/orders {
+        limit_req zone=api burst=40 nodelay;
+        set $upstream http://orders-service:8000;
+        proxy_pass $upstream;
+    }
+
+    # Cualquier otra ruta de API no existe (los /health y /docs internos no se exponen).
+    location /api/ {
+        default_type application/json;
+        return 404 '{"detail":"Ruta no encontrada"}';
+    }
+
+    # --- frontend (Vue) -----------------------------------------------------
+    location / {
+        limit_req zone=api burst=80 nodelay;
+        set $upstream http://frontend:8080;
+        proxy_pass $upstream;
+    }
+
+    location @too_many_requests {
+        default_type application/json;
+        return 429 '{"detail":"Demasiadas solicitudes. Espera un momento e intenta de nuevo."}';
+    }
+
+    location @service_unavailable {
+        default_type application/json;
+        return 503 '{"detail":"El servicio no está disponible en este momento."}';
+    }
+}
